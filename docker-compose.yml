@@ -1,0 +1,37 @@
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: app/api/Dockerfile
+    ports: 
+      - "8000:8000"
+    depends_on:
+      - redis
+      - postgres
+    environment:
+      DATABASE_URL: postgresql://leaderboard_owner:password@postgres/leaderboard_db
+      REDIS_URI: redis://redis:6379
+    volumes:
+      # Bind mount for the API code
+      - ./app/api:/app/api  # the reference point is where the yml file resides. In this case it's in root with root/app/api structure. it then maps to /app/api in the container. 
+      - ./app/leaderboard_service:/app/leaderboard_service
+    networks:
+      - app_network
+  redis:
+    image: redis:latest
+    networks:
+      - app_network
+  postgres:
+    image: postgres:alpine
+    environment:
+      - POSTGRES_USER=leaderboard_owner
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=leaderboard_db
+    ports: 
+      - "5432:5432"
+    networks:
+      - app_network
+networks:
+  app_network:
+    driver: bridge

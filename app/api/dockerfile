@@ -1,0 +1,24 @@
+# Use an official Python runtime as a parent image
+FROM python:3.10
+
+# Set the working directory in the container
+WORKDIR /app
+
+
+# Copy requirements.txt from the leaderboard root directory
+COPY ../requirements.txt .
+
+COPY .env /app/.env
+
+# Install any needed packages specified in requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+
+# Copy the current directory contents into the container at /app
+# COPY  . /app/
+
+ENV PYTHONPATH="${PYTHONPATH}:/app"
+
+
+# Command to run your app
+CMD ["python3", "-m", "api.main"]
