@@ -10,6 +10,7 @@ class User(SQLModel, table=True):
     username : str = Field(unique=True, nullable=False)
     email : str = Field(unique=True, nullable=False)
     hashed_password : str = Field(nullable=False)
+    country : str = Field(nullable=False)
     is_active : bool = Field(default=True)
     is_admin : bool = Field(default=False)
     date_added : datetime = Field(default_factory=datetime.utcnow, nullable=False)

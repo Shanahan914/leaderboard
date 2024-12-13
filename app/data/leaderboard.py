@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 ## 0.2 redis setup ##
 
-# redis setup for leaderboard
+# redis setup for all time leaderboard
 r_leaderboard = redis.StrictRedis(host='redis', port=6379, db=0, decode_responses=True)
 
 # redis cache for user (id -> username)
@@ -68,9 +68,11 @@ def retry_submit_score(score:ScorePublic, user_id):
 
 # retrieves the user's rank and score for a single game
 def retrieve_ranking(user_id: int, game_id:int):
-    rank = r_leaderboard.zrevrank(game_id, user_id)
+    rank = r_leaderboard.zrevrank(game_id, user_id) 
+    print('raw rank', rank)
     score = r_leaderboard.zscore(game_id, user_id)
-    return (rank, score)
+    rank_int = int(rank) + 1
+    return (rank_int, score)
 
 
 ## 2.3 retrieve leaders for a game ##
@@ -78,6 +80,12 @@ def retrieve_ranking(user_id: int, game_id:int):
 # retrieves the leaderboard for a single game
 def retrieve_leaders(game_id: int, start : int, end : int):
     return r_leaderboard.zrevrange(game_id, start, end, withscores=True)
+
+
+# retrieves the leaderboard for a single game
+def retrieve_leaders_no_score(game_id: int, start : int, end : int):
+    return r_leaderboard.zrevrange(game_id, start, end)
+
 
 
 ### 3. CACHE for id to name lookup - game and user_id ###
@@ -99,8 +107,8 @@ def set_game_cache(game_name : str, id : str):
 def retry_set_user_cache(username : str, id : str):
     retry_cache_operation(set_user_cache, username, id)
 
-def retry_set_game_cache(username : str, id : str):
-    retry_cache_operation(set_game_cache, username, id)
+def retry_set_game_cache(game_name : str, id : str):
+    retry_cache_operation(set_game_cache, game_name, id)
 
 def get_user_cache(id : str):
     return r_user.get(id)
@@ -117,4 +125,50 @@ def get_multiple_usernames(list_user_ids):
     results = pipeline.execute()
     return results
 
+
+def add_multiple_usernames(list_user_data):
+    pipeline = r_user.pipeline()
+
+    for item in list_user_data:
+        pipeline.set(item[0], item[1])
+        
+    results = pipeline.execute()
+    return results
+
+
+# 4.0 get users ranking for all games
+def user_data_all_games(user_id : int):
+    pass
+    # get all game ids from redis
+    cursor = 0
+    game_keys = []
+
+    while True:
+        cursor, keys = r_leaderboard.scan(cursor, match='*', count=1000, _type='zset')
+        game_keys.extend(keys)
+        if cursor == 0:
+            break
     
+    # return None if no game keys found in redis
+    if game_keys == []:
+        logger.warning(f"No game id keys found in redis. User concerned is {user_id}")
+        return None 
+    
+    # create a pipeline to retrieve the user's rankings
+    pipeline = r_leaderboard.pipeline()
+
+    for key in game_keys:
+        pipeline.zrevrank(key, user_id)
+
+    results = pipeline.execute()
+
+    # need to add 1 to get in ordinal complaint format 
+    results_adjusted = [result + 1 for result in results if result is not None]
+
+    user_rankings = {key : result for (key, result) in zip(game_keys, results_adjusted)}
+
+    return user_rankings
+
+
+# 5.0 get leaders for a game
+

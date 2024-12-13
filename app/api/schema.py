@@ -2,6 +2,7 @@ from pydantic import BaseModel
 from enum import Enum
 from datetime import datetime
 from typing import List 
+from datetime import datetime
 
 ### 1. USER ###
 
@@ -9,6 +10,7 @@ from typing import List
 class UserInput(BaseModel):
     username : str
     email: str 
+    country : str
     plain_password: str
     is_admin: bool | None = None
 
@@ -18,6 +20,7 @@ class UserPublic(BaseModel):
     username: str
     email: str
     is_active: bool | None = None
+    country : str
 
 # user for internall (full)
 class UserPrivate(UserPublic):
@@ -56,10 +59,15 @@ class ScorePublic(BaseModel):
 
 ### 4. Rank ###
 
-class SingleRankPublic(BaseModel):
+class SingleRank(BaseModel):
     game: str
     rank : int
+
+class SingleRankWithScore(SingleRank):
     score : float 
+
+class MultipleRanks(BaseModel):
+    games : List[SingleRank]
 
 
 ### 5. Game ids 
@@ -72,3 +80,15 @@ class GameID(GameIDInput):
 
 class GameLookUp(BaseModel):
     games: List[GameID]
+
+
+### 6. Player profile
+
+class TopPlayerInfo(BaseModel):
+    username : str
+    country : str
+    date_joined : datetime
+
+
+class TopPlayerList(BaseModel):
+    leaders : List[TopPlayerInfo]

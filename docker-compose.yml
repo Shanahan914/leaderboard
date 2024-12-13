@@ -15,7 +15,7 @@ services:
     volumes:
       # Bind mount for the API code
       - ./app/api:/app/api  # the reference point is where the yml file resides. In this case it's in root with root/app/api structure. it then maps to /app/api in the container. 
-      - ./app/leaderboard_service:/app/leaderboard_service
+      - ./app/data:/app/data
     networks:
       - app_network
   redis:
