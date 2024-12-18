@@ -1,7 +1,7 @@
 from pydantic import BaseModel 
 from enum import Enum
 from datetime import datetime
-from typing import List 
+from typing import List, Dict
 from datetime import datetime
 
 ### 1. USER ###
@@ -76,10 +76,10 @@ class GameIDInput(BaseModel):
     name : str
 
 class GameID(GameIDInput):
-    id: int
+    id: str
 
 class GameLookUp(BaseModel):
-    games: List[GameID]
+    games: Dict[str, str]
 
 
 ### 6. Player profile

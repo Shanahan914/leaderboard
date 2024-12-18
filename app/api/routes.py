@@ -1,32 +1,27 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Query
-from typing import List
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.security import OAuth2PasswordRequestForm
 from typing import Annotated
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 import logging
 from .database import SessionDep
-from .auth import authenticate_user, create_access_token, get_password_hash, get_current_user
+from .auth import get_current_user, login_for_access_token, authenticate_user, create_access_token
 from .schema import Token, UserInput, UserPublic, ScorePublic, ScoreInput, SingleRankWithScore, GameLookUp, GameID, GameIDInput, MultipleRanks, TopPlayerList
 from .models import User, Score, Game
-from data.leaderboard import retry_submit_score, retrieve_ranking, retrieve_leaders, retry_set_user_cache, retry_set_game_cache, get_game_cache, get_multiple_usernames, add_multiple_usernames, user_data_all_games
-from data.postgres import get_player_info
-from sqlmodel import select
+from data.data_service import DataService, DataServiceException
 from sqlalchemy.exc import IntegrityError, OperationalError
 from redis.exceptions import ConnectionError, RedisError
-import copy
 
 
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
 ### 0 SETUP ###
 
-
-## 0.1 router ## 
+## router ## 
 
 router = APIRouter()
 
 
-## 0.2 logger ##
+## logger ##
 
 # initialize logger 
 logging.basicConfig(level=logging.INFO,
@@ -39,78 +34,19 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger(__name__)
 
 
-## 0.3 error handling ##
+## error handling ##
+
 def log_and_raise_error(message: str, status_code: int = 500):
     logger.error(message)
     raise HTTPException(status_code=status_code, detail=message)
 
 
-## 0.4 read from postgres if operation (redis-based) does not return the value 
-def read_db_value(operation, cache_add, session, id, model, attribute: str):
-    try:
-        value = operation(id)
-        if not value:
-            print('cache miss')
-            raise ValueError('Cache miss')
-        
-    except ValueError as e:
-        logger.error(f'cache miss for {model.__name__}: {id}')
-        data = session.get(model, id)
-        value = getattr(data, attribute, None) if data else None
-        #add to cache
-        cache_add(data, id)
-        print('cache add')
+## check if current user is the owner of the resource requested
 
-    except Exception as e:
-        logger.error(f'Failed to read {model.__name__} from redis: {e}')
-        data = session.get(model, id)
-        value = getattr(data, attribute, None) if data else None
-        #add to cache
-        cache_add(data, id)
-        print('cache add')
-
-    if not value:
-        log_and_raise_error(f"Failed to read game from cache or db for game_id {id}")
-    return value
-
-
-## 0.5 lookup various users from postgres
-def retrieve_multiple_usernames_pg(list_of_ids : List[str], session):
-    # get data from postgres
-    try:
-        data = session.exec(select(User).where(User.id.in_(list_of_ids))).all()
-    except Exception as e:
-        logger.error(f"Failure to read data from db: {e} for users: {list_of_ids}")
-        return []
-    
-    if data is None:
-        logger.error('Failed to retrieve data from db')
-        return []
-    
-    # prepare data for writing
-    id_username_data = []
-    for item in data:
-        id = getattr(item, 'id', None)
-        username = getattr(item, 'username', None)
-        id_username_data.append((id, username))
-        
-    write_multiple_usernames_redis(id_username_data)
-    return id_username_data
-
-## 0.6 write multiple users to redis user cache ##
-def write_multiple_usernames_redis(user_data):
-    try:
-        redis_response = add_multiple_usernames(user_data)
-        return redis_response
-    except RedisError as e:
-        logger.error(f"Failure to write data to redis: {e} for users: {user_data}")
-        return []
-    
-
-## 0.7 check if current user is the owner of the resource requested
 def check_user(current_user : int , user_id : int):
+
     if current_user != user_id:
-        raise HTTPException(status_code=401, detail=f'you do not have permission to view this resource. {current_user}')
+        raise HTTPException(status_code=401, detail=f'you do not have permission to view this resource for user {current_user}')
 
 ## --------------------##
 ### 1. ENDPOINTS ###
@@ -124,30 +60,21 @@ def check_user(current_user : int , user_id : int):
 # register endpoint
 @router.post("/users/register/", response_model=UserPublic)
 def create_user(user: UserInput, session: SessionDep):
-    #get hashed password
+    # add the user to the database.
     try:
-        hashed_password = get_password_hash(user.plain_password)
+        data_service = DataService(session, logger)
+        new_user = data_service.add_user(user)
+    except DataServiceException as e:
+        log_and_raise_error(f"DataServiceError: {e}", 500)
     except Exception as e:
-        log_and_raise_error(f"Error hashing password: {e}", 400)
-    
-    #create new User instance
-    try: 
-        new_user = User(email = user.email, username=user.username, hashed_password=hashed_password, is_admin=user.is_admin)
-        session.add(new_user)
-        session.commit()
-        session.refresh(new_user)
-        
-    except IntegrityError as e:
-        session.rollback()
-        log_and_raise_error(f"User with this username/email already exists: {e}", 400)
-    except RedisError as e:
-        log_and_raise_error(f"Error adding to cache : {e}", 400)
-    except Exception as e:
-        log_and_raise_error(f"Error adding user to db: {e}", 400)
-    
-    # set id -> username in cache
-    retry_set_user_cache(new_user.username, new_user.id)
+        log_and_raise_error(f"Error trying to create user: {e}", 500)
 
+    # add the username to the cache
+    try:
+        data_service.set_user_cache(new_user.username, new_user.id)
+    except DataServiceException as e:
+        # no exception raised if user is not added to the cache
+        logger.error(f"DataServiceError: {e}")
     return new_user
 
 
@@ -157,22 +84,26 @@ def create_user(user: UserInput, session: SessionDep):
 # POST 
 # register endpoint
 @router.post("/auth/token")
-async def login_for_access_token(
+async def login(
     form_data: Annotated[OAuth2PasswordRequestForm, Depends()],
     session: SessionDep
 ) -> Token:
-    print( form_data.username)
+    
+    # verify user details
     user = authenticate_user(session, form_data.username, form_data.password)
     if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        log_and_raise_error(f"Incorrect username or password", 401)
+    
+    # create access token
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": user.email}, expires_delta=access_token_expires
-    )
+    try:
+        access_token = create_access_token(
+            data={"sub": user.email}, expires_delta=access_token_expires
+        )
+    except Exception as e:
+        log_and_raise_error(f"Failed to create access token : {e}", 500)
+
+    # return token
     return Token(access_token=access_token, token_type="bearer")
 
 
@@ -183,13 +114,23 @@ async def login_for_access_token(
 # ids for games
 # postgres
 @router.get("/games", response_model=GameLookUp)
-def all_game_ids(session : SessionDep):
+def all_game_ids(session : SessionDep,
+                  current_user: Annotated[User, Depends(get_current_user)]):
+    
+    # retrieve game list from db
     try:
-        games = session.exec(select(Game)).all()
-        return GameLookUp(games = [GameID(id = game.id, name=game.name) for game in games])
-    except Exception as e:
-        log_and_raise_error(f"Error when retrieving data: {e}", 500)
+        data_service = DataService(session, logger)
+        data = data_service.get_list_games()
 
+    except DataServiceException as e:
+        log_and_raise_error(f"Error reading from db: {e}", 404)
+    
+    # format game list
+    all_games_string_keys = {str(k): v for k,v in data.items()}
+    formatted_data = GameLookUp(games = all_games_string_keys)
+
+    return formatted_data
+ 
 
 ## 1.4 create a new game entry ##
 
@@ -205,21 +146,10 @@ def add_game(game: GameIDInput,
              current_user: Annotated[User, Depends(get_current_user)]):
     
     if current_user.is_admin != True:
-        raise HTTPException(status_code=401, detail=f'You do not have permission to view this resource.')
-    try:
-        new_game = Game(name = game.name)
-        session.add(new_game)
-        session.commit()
-        session.refresh(new_game)
-        
-    except IntegrityError as e:
-        session.rollback()
-        log_and_raise_error(f"Game with this name already exists: {e}", 400)
-    except Exception as e:
-        log_and_raise_error(f"Error adding user to db: {e}", 500)
+        log_and_raise_error(f'You do not have permission to view this resource', 401)
     
-    # add id -> name to cache
-    retry_set_game_cache(new_game.name, new_game.id)
+    data_service = DataService(session, logger)
+    new_game = data_service.add_game(game)
 
     return new_game
 
@@ -231,17 +161,16 @@ def add_game(game: GameIDInput,
 # score submission 
 # redis & pg
 @router.post("/users/{user_id}/scores", response_model=ScorePublic)
-def submit_scores(user_id : int, score: ScoreInput, session: SessionDep):
-    try:
-        # add to postgres
-        new_score = Score(user_id = user_id, game_id=score.game_id, score=score.score)
-        session.add(new_score)
-        session.commit()
-        session.refresh(new_score)
-    except Exception as e:
-        log_and_raise_error(f"Error adding score to db: {e}", 500)
-     # add to redis
-    retry_submit_score(score, user_id)
+def submit_scores(user_id : int, 
+                  score: ScoreInput, 
+                  session: SessionDep, 
+                  current_user: Annotated[User, Depends(get_current_user)]):
+    
+    # ensure current user matches user_id
+    check_user(current_user.id, user_id)
+
+    data_service = DataService(session, logger)
+    new_score = data_service.submit_score(score, user_id) 
     
     return new_score
 
@@ -257,59 +186,58 @@ def submit_scores(user_id : int, score: ScoreInput, session: SessionDep):
 @router.get("/games/leaderboard/{game_id}")
 def leaderboard_single_game(game_id: int,
                             session : SessionDep,
-                        start: int = Query(0, ge=0),
-                        end: int = Query(9, ge=4)):
-    # retrieve from redis
-    try:
-        data = retrieve_leaders(game_id, start, end)
-    except RedisError as e:
-        log_and_raise_error(f'Failed to fetch leaders for game {game_id} : {e}', 500)
+                            current_user: Annotated[User, Depends(get_current_user)],
+                            start: int = Query(0, ge=0),
+                            end: int = Query(9, ge=4)):
+
+    # fetch the leaders
+    data_service = DataService(session, logger)
+    data = data_service.get_leaderboard_with_score(game_id, start, end)
 
     # if no data, return early
     if not data:
-        HTTPException(status_code=404, detail="No leaderboard data found")
+        log_and_raise_error("No leaderboard data found", 404)
     
-    ## lookup usernames for the leaders
     # selects the user ids of the leaders
     user_ids = [entry[0] for entry in data]
-    # gets the multiple usernames
-    usernames = get_multiple_usernames(user_ids)
-    print(usernames)
+
+    # gets data for multiple users from redis
+    usernames = data_service.get_mutiple_usernames(user_ids)
     
-    # add missing usernames to the cache
+    # query missing usernames, add them to the data and then add to cache
     if None in usernames:
-        #look up the missing usernames
-        missing_usernames = [user_ids[i] if usernames[i] is None else None for i in range(len(usernames))]
-        missing_data = retrieve_multiple_usernames_pg(missing_usernames)
-        # prepare data
-        username_or_id = [user_ids[i] if usernames[i] == None else usernames[i] for i in range(len(usernames))]
+        #pick out the user_ids where we don't have the username
+        missing_usernames = [user_id for user_id, username in zip(user_ids, usernames) if username is None]
+        # fetch the data from postgres. 
+        missing_data = data_service.get_multiple_users(missing_usernames)
 
-        # Step 1: Create a dictionary from the list of tuples
-        new_usernames_dict = {user_id: username for user_id, username in missing_data}
+        # put data into a dict for referencing below
+        missing_data_dict= {row.id : row.username for row in missing_data}
 
-        # Step 2: Update the missing_usernames list
+        # zip together user_ids and usernames, if username is none then look for missing username in missing_data_dict
         usernames = [
-            new_usernames_dict.get(str(user_id), user_id) if isinstance(user_id, int) else user_id
-            for user_id in username_or_id
-        ]
-
+        missing_data_dict.get(user_id, user_id) if username is None else username
+        for user_id, username in zip(user_ids, usernames)
+    ]
 
     # lookup game name using game id
-    game_name = read_db_value(get_game_cache, retry_set_game_cache, session, game_id, Game, 'name')
+    game_name = data_service.get_game_cache_or_add_db(game_id)
+    if game_name is None:
+        logger.error('failed to retrieve game : {game_id}')
+        raise HTTPException(detail="Failed to retrieve game name", status_code=404)
 
-    # construct response
-    response_data = []
-    rank = start
 
     if len(data) != len(usernames):
-        HTTPException(detail="Error in formatting data", status_code=500)
+        raise HTTPException(detail="Error in formatting data", status_code=500)
 
-    for i in range(len(data)):
-        rank += 1
-        response_data.append({
-            "rank": rank, 
-            "username": usernames[i], 
-            "score": data[i][1]})
+    response_data = [
+        {
+            "rank": start + idx + 1,
+            "username": username,
+            "score": entry[1]
+        }
+        for idx, (entry, username) in enumerate(zip(data, usernames))
+]
    
     return {"game" :game_name, "data": response_data}
 
@@ -324,24 +252,25 @@ def leaderboard_single_game(game_id: int,
 def user_score_single_game(user_id: int, game_id,
                            current_user: Annotated[User, Depends(get_current_user)],
                            session : SessionDep) -> SingleRankWithScore:
+    
     # ensure current user is asking about their own resource
-    if current_user.id != user_id:
-        raise HTTPException(status_code=401, detail=f'you do not have permission to view this resource. {current_user.id}')
+    check_user(current_user.id, user_id )
     
     # retrieve rank and score from redis
+    data_service = DataService(session, logger)
+
     try:
-        rank, score = retrieve_ranking(user_id, game_id)
+        rank, score = data_service.get_single_ranking(user_id, game_id)
         if rank is None or score is None:
+            logger.error(f'Failed to find score or rank for user {user_id} and game {game_id}')
             raise HTTPException(status_code=400, detail="Could not find the rank of the user for this game.")
     except ConnectionError:
         raise HTTPException(status_code=503, detail="Redis connection failed.")
     except Exception as e:
         log_and_raise_error(f"Unexpected error occurred: {e}", 500)
-    if rank == None or score == None:
-        raise HTTPException(status_code=400, detail=f'Could not find the rank of the user for this game. Please check the provided details.')
     
     # get game name
-    game_name = read_db_value(get_game_cache, retry_set_game_cache, session, game_id, Game, 'name')
+    game_name = data_service.get_game_cache_or_add_db(game_id)
 
     return {"game" : game_name, "rank": rank, "score" : score}
 
@@ -351,22 +280,30 @@ def user_score_single_game(user_id: int, game_id,
 # users/{user_id}/ranking
 # GET
 # user's rankings for all games
-# redis
-@router.get('/users/{user_id}/ranking', response_model = MultipleRanks)
+@router.get('/users/{user_id}/ranking')
 def users_rankings_all_game(user_id : int, 
                             current_user: Annotated[User, Depends(get_current_user)],
                             session : SessionDep):
+    
     # ensure current user is asking about their own resource
     check_user(current_user.id, user_id)
 
     # retrieve data from redis
-    results = user_data_all_games(user_id)
+    data_service = DataService(session, logger)
+    results = data_service.get_rankings_all_games(user_id)
+
+    all_games = data_service.get_list_games()
+
+    all_games_string_keys = {str(k): v for k,v in all_games.items()}
+
+    results_with_names = {all_games_string_keys[k] : v for k,v in results.items()}
+
 
     # raise exception or return the data
     if results == None:
-        HTTPException(status_code=404, detail = "No ranking information found")
+        raise HTTPException(status_code=404, detail = "No ranking information found")
     
-    return results
+    return results_with_names
 
 
 ## 1.9 info on the top 10 players for an individual game
@@ -374,20 +311,18 @@ def users_rankings_all_game(user_id : int,
 # games/{game_id}/leaders
 # GET
 # top players report for a single game
-# pg
-@router.get('games/{game_id}/leaders', response_model= TopPlayerList)
+@router.get('/games/{game_id}/leaders')
 def top_players(game_id : int,
                 current_user: Annotated[User, Depends(get_current_user)],
                 session : SessionDep):
-    
-    # get top 10 players for the game from redis
-    leaders = retrieve_leaders(game_id, 0, 9)
 
-    # retrieve player information from postgres
-    player_data = get_player_info(leaders, session)
+    # retrieve info on the top 10 players
+    data_service = DataService(session, logger)
 
-    if player_data is None:
+    leaders_data = data_service.retrieve_top_player_report(game_id)
+
+    if leaders_data is None:
         return HTTPException(status_code=404, detail = 'Failed to find top player report data')
     
-    return player_data
+    return leaders_data
 

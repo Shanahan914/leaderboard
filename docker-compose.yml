@@ -16,6 +16,15 @@ services:
       # Bind mount for the API code
       - ./app/api:/app/api  # the reference point is where the yml file resides. In this case it's in root with root/app/api structure. it then maps to /app/api in the container. 
       - ./app/data:/app/data
+    ulimits:
+      nofile:
+        soft: 8192
+        hard: 16384
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+          cpus: '1.0'
     networks:
       - app_network
   redis:
